@@ -1,41 +1,43 @@
 // Vercel Serverless Function: /api/vocab?query=haus&limit=5
-// Tarayıcı bu adrese istek atar; API anahtarı yalnızca burada, ortam değişkeninde durur.
-const UPSTREAM = process.env.GERMAN_API_URL || 'https://german-language.onrender.com/vocab';
+// Kendi sözlük verimizi (data/words.json) arar. API anahtarı / dış servis yok.
+const WORDS = require('../data/words.json');
 
-module.exports = async function handler(req, res) {
+const fold = (s) =>
+  String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/ß/g, 'ss').replace(/ı/g, 'i');
+
+const INDEX = WORDS.map((w) => ({ w, de: fold(w.german), tr: fold(w.turkish) }));
+
+function score(key, q) {
+  if (key === q) return 0;
+  if (key.startsWith(q)) return 1;
+  if (key.split(/[\s,;\/()]+/).some((p) => p.startsWith(q))) return 2;
+  if (key.includes(q)) return 3;
+  return -1;
+}
+
+function search(query, limit) {
+  const q = fold(query).trim();
+  if (!q) return [];
+  const hits = [];
+  for (const e of INDEX) {
+    const a = score(e.de, q), b = score(e.tr, q);
+    const s = a < 0 ? b : b < 0 ? a : Math.min(a, b);
+    if (s >= 0) hits.push([s, Math.min(e.de.length, e.tr.length || 99), e.w]);
+  }
+  hits.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  return hits.slice(0, limit).map((h) => h[2]);
+}
+
+module.exports = function handler(req, res) {
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET');
     return res.status(405).json({ error: 'Yalnızca GET desteklenir' });
   }
-
   const query = String(req.query.query || '').trim().slice(0, 60);
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 5, 1), 10);
   if (!query) return res.status(400).json({ error: 'query gerekli' });
-
-  const key = process.env.GERMAN_API_KEY;
-  if (!key) return res.status(500).json({ error: 'GERMAN_API_KEY tanımlı değil' });
-
-  const url = new URL(UPSTREAM);
-  url.searchParams.set('query', query);
-  url.searchParams.set('limit', String(limit));
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
-  try {
-    const r = await fetch(url, {
-      headers: { 'X-API-Key': key, Accept: 'application/json' },
-      signal: ctrl.signal,
-    });
-    const body = await r.text();
-    if (!r.ok) return res.status(502).json({ error: 'Sözlük servisi hata verdi', status: r.status });
-
-    // Aynı aramayı 1 gün Vercel önbelleğinden sun: hem hızlı hem API limitini korur.
-    res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=604800');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.status(200).send(body);
-  } catch (e) {
-    return res.status(504).json({ error: 'Sözlük servisine ulaşılamadı' });
-  } finally {
-    clearTimeout(timer);
-  }
+  res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=604800');
+  return res.status(200).json({ results: search(query, limit) });
 };
+module.exports.search = search;
